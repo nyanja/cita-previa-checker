@@ -14,6 +14,7 @@ Usage:
 import argparse
 import asyncio
 import logging
+import os
 import random
 import subprocess
 from datetime import datetime
@@ -21,15 +22,8 @@ from urllib.request import urlopen, Request
 from urllib.parse import urlencode
 
 from playwright.async_api import async_playwright, Page, BrowserContext
-from playwright_stealth import Stealth
 
 import config
-
-# Initialize stealth with Spanish locale settings
-stealth = Stealth(
-    navigator_languages_override=("es-ES", "es"),
-    navigator_platform_override="MacIntel",
-)
 
 # --- Logging ---
 logging.basicConfig(
@@ -38,6 +32,17 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("cita-checker")
+
+
+FOUND_LOG = os.path.join(os.path.dirname(__file__), "found.log")
+
+
+def log_found(dt: datetime):
+    """Append a timestamp to found.log when appointments are detected."""
+    line = dt.strftime("%Y-%m-%d %H:%M") + "\n"
+    with open(FOUND_LOG, "a") as f:
+        f.write(line)
+    log.info(f"Logged to {FOUND_LOG}")
 
 
 # --- Notification ---
@@ -91,61 +96,49 @@ async def slow_type(page: Page, selector: str, text: str):
 
 
 # --- Browser setup ---
+CDP_PORT = 9222
+
+
 async def create_browser_context(playwright) -> tuple:
-    """Create a stealth browser context."""
-    browser = await playwright.chromium.launch(
-        headless=False,  # Headed mode is less likely to be detected
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ],
-    )
+    """Connect to real Chrome via CDP. Chrome must be running with --remote-debugging-port."""
+    try:
+        browser = await playwright.chromium.connect_over_cdp(f"http://localhost:{CDP_PORT}")
+    except Exception:
+        log.error(
+            f"Cannot connect to Chrome on port {CDP_PORT}. Start Chrome with:\n"
+            f'  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port={CDP_PORT}'
+        )
+        raise
 
-    context = await browser.new_context(
-        viewport={"width": random.randint(1200, 1400), "height": random.randint(800, 1000)},
-        locale="es-ES",
-        timezone_id="Europe/Madrid",
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            f"Chrome/{random.choice(['120', '121', '122', '123', '124', '125'])}.0.0.0 Safari/537.36"
-        ),
-    )
-
+    context = browser.contexts[0] if browser.contexts else await browser.new_context()
     return browser, context
 
 
 # --- Page flow ---
-async def step1_load_page(page: Page) -> bool:
-    """Navigate to the initial page."""
-    log.info("Step 1: Loading cita previa page...")
+ENTRY_URL = "https://icp.administracionelectronica.gob.es/icpplus/"
+PROVINCE_VALUE = "/icpplustieb/citar?p=8&locale=es"  # Barcelona
+
+
+async def check_waf(page: Page) -> bool:
+    """Return True if WAF blocked us."""
+    if "Request Rejected" in (await page.content()):
+        log.error("WAF blocked!")
+        return True
+    return False
+
+
+async def step1_select_province(page: Page) -> bool:
+    """Go to the generic entry page and select Barcelona province."""
+    log.info("Step 1: Loading province selection page...")
     try:
-        await page.goto(config.BASE_URL, wait_until="domcontentloaded", timeout=30000)
+        await page.evaluate(f'window.location.href = "{ENTRY_URL}"')
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
         await human_delay(2, 4)
 
-        # Check for WAF block
-        if "Request Rejected" in (await page.content()):
-            log.error("WAF blocked us on initial page load!")
+        if await check_waf(page):
             return False
 
-        # Verify we're on the right page
-        title = await page.title()
-        if "cita previa" not in title.lower() and "solicitud" not in title.lower():
-            log.warning(f"Unexpected page title: {title}")
-
-        return True
-    except Exception as e:
-        log.error(f"Failed to load page: {e}")
-        return False
-
-
-async def step2_select_tramite(page: Page) -> bool:
-    """Select the office and tramite, then click Aceptar."""
-    log.info("Step 2: Selecting office and tramite...")
-    try:
-        # Accept cookies if banner is present
+        # Accept cookies if present
         try:
             cookie_btn = page.locator("a:has-text('Acepto')")
             if await cookie_btn.is_visible(timeout=2000):
@@ -154,6 +147,29 @@ async def step2_select_tramite(page: Page) -> bool:
         except Exception:
             pass
 
+        # Select Barcelona from province dropdown
+        await human_delay(1, 2)
+        province_select = page.locator("#form")
+        await province_select.select_option(value=PROVINCE_VALUE)
+        await human_delay(1.5, 3)
+
+        # Click Aceptar
+        await page.click("#btnAceptar")
+        await human_delay(2, 4)
+
+        if await check_waf(page):
+            return False
+
+        return True
+    except Exception as e:
+        log.error(f"Failed to select province: {e}")
+        return False
+
+
+async def step2_select_tramite(page: Page) -> bool:
+    """Select the office and tramite, then click Aceptar."""
+    log.info("Step 2: Selecting office and tramite...")
+    try:
         # Select office
         await human_delay(1, 2)
         office_select = page.locator("#sede")
@@ -169,10 +185,7 @@ async def step2_select_tramite(page: Page) -> bool:
         await page.click("#btnAceptar")
         await human_delay(2, 4)
 
-        # Check for WAF
-        content = await page.content()
-        if "Request Rejected" in content:
-            log.error("WAF blocked us after selecting tramite!")
+        if await check_waf(page):
             return False
 
         return True
@@ -189,13 +202,7 @@ async def step3_click_entrar(page: Page) -> bool:
         await human_delay(1.5, 3)
         await page.click("#btnEntrar")
         await human_delay(2, 4)
-
-        content = await page.content()
-        if "Request Rejected" in content:
-            log.error("WAF blocked us after clicking Entrar!")
-            return False
-
-        return True
+        return not await check_waf(page)
     except Exception as e:
         log.error(f"Failed to click Entrar: {e}")
         return False
@@ -208,11 +215,9 @@ async def step4_fill_personal_data(page: Page) -> bool:
         await human_delay(1, 2)
 
         # For this tramite, only NIE is available (already selected)
-        # Fill NIE number
         await slow_type(page, "#txtIdCitado", config.DOC_NUMBER)
         await human_delay(0.5, 1)
 
-        # Fill name
         await slow_type(page, "#txtDesCitado", config.FULL_NAME)
         await human_delay(0.5, 1)
 
@@ -225,16 +230,9 @@ async def step4_fill_personal_data(page: Page) -> bool:
         except Exception:
             pass
 
-        # Click Aceptar (on this page it's #btnEnviar)
         await page.click("#btnEnviar")
         await human_delay(2, 4)
-
-        content = await page.content()
-        if "Request Rejected" in content:
-            log.error("WAF blocked us after personal data!")
-            return False
-
-        return True
+        return not await check_waf(page)
     except Exception as e:
         log.error(f"Failed to fill personal data: {e}")
         return False
@@ -248,13 +246,7 @@ async def step5_solicitar_cita(page: Page) -> bool:
         await human_delay(1, 2)
         await page.click("#btnEnviar")
         await human_delay(2, 4)
-
-        content = await page.content()
-        if "Request Rejected" in content:
-            log.error("WAF blocked us after Solicitar Cita!")
-            return False
-
-        return True
+        return not await check_waf(page)
     except Exception as e:
         log.error(f"Failed to click Solicitar Cita: {e}")
         return False
@@ -309,72 +301,73 @@ async def run_check(playwright) -> tuple[str, object]:
     Browser is returned open when result != "unavailable" so user can interact.
     """
     browser, context = await create_browser_context(playwright)
+    page = await context.new_page()
 
     try:
-        page = await context.new_page()
-        await stealth.apply_stealth_async(page)
 
-        # Flow verified manually on the live site:
-        # Page 1: Select tramite (btnAceptar)
-        # Page 2: Info page (btnEntrar)
-        # Page 3: Personal data - NIE + name (btnEnviar)
-        # Page 4: Action selection - "Solicitar Cita" (btnEnviar)
-        # Page 5: Result - shows availability or "no hay citas disponibles"
 
-        # Step 1: Load initial page
-        if not await step1_load_page(page):
-            await browser.close()
+        # Flow: all button clicks, no direct URL navigation after entry
+        # 1. /icpplus/ -> select Barcelona -> Aceptar
+        # 2. Select tramite -> Aceptar
+        # 3. Info page -> Entrar
+        # 4. Personal data -> Aceptar
+        # 5. Solicitar Cita -> result
+
+        # Step 1: Select province (Barcelona)
+        if not await step1_select_province(page):
+            await page.close()
             return "waf_blocked", None
 
         # Step 2: Select tramite + click Aceptar
         if not await step2_select_tramite(page):
-            await browser.close()
+            await page.close()
             return "waf_blocked", None
 
         # Step 3: Click Entrar on info page
         if not await step3_click_entrar(page):
-            await browser.close()
+            await page.close()
             return "waf_blocked", None
 
         # Step 4: Fill personal data (NIE + name required)
         if not config.DOC_NUMBER:
             log.error("DOC_NUMBER not configured in config.py - cannot proceed past info page")
-            await browser.close()
+            await page.close()
             return "error", None
 
         if not await step4_fill_personal_data(page):
-            await browser.close()
+            await page.close()
             return "error", None
 
         # Step 5: Click "Solicitar Cita"
         if not await step5_solicitar_cita(page):
-            await browser.close()
+            await page.close()
             return "error", None
 
         # Now check result page for availability
         result = await check_availability(page)
         if result == "unavailable":
-            await browser.close()
+            await page.close()
             return "unavailable", None
 
         if result == "available":
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             await page.screenshot(path=f"/tmp/cita_AVAILABLE_{ts}.png")
-            log.info("BROWSER LEFT OPEN - go complete your appointment!")
-            return "available", browser
+            log_found(datetime.now())
+            log.info("PAGE LEFT OPEN - go complete your appointment!")
+            return "available", page
 
-        # Unknown page state - keep browser open for inspection
+        # Unknown page state - keep page open for inspection
         text = await page.inner_text("body")
         log.info(f"Page text (first 500 chars): {text[:500]}")
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         await page.screenshot(path=f"/tmp/cita_unknown_{ts}.png")
         log.info(f"Screenshot saved: /tmp/cita_unknown_{ts}.png")
-        log.info("BROWSER LEFT OPEN for inspection")
-        return "error", browser
+        log.info("PAGE LEFT OPEN for inspection")
+        return "error", page
 
     except Exception as e:
         log.error(f"Check failed with exception: {e}")
-        await browser.close()
+        await page.close()
         return "error", None
 
 
@@ -383,10 +376,10 @@ async def list_offices(playwright):
     browser, context = await create_browser_context(playwright)
     try:
         page = await context.new_page()
-        await stealth.apply_stealth_async(page)
 
-        await page.goto(config.BASE_URL, wait_until="domcontentloaded", timeout=30000)
-        await human_delay(2, 3)
+
+        await step1_select_province(page)
+        await human_delay(1, 2)
 
         offices = await page.eval_on_selector_all(
             "#sede option",
@@ -399,7 +392,7 @@ async def list_offices(playwright):
             print(f"  Value: {o['value']:4s}  |  {o['text']}")
         print("-" * 80)
     finally:
-        await browser.close()
+        await page.close()
 
 
 def get_hot_window() -> dict | None:
@@ -450,7 +443,7 @@ async def main():
             check_count += 1
             log.info(f"=== Check #{check_count} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
 
-            result, browser = await run_check(playwright)
+            result, open_page = await run_check(playwright)
 
             if result == "available":
                 notify(
@@ -458,12 +451,10 @@ async def main():
                     "Hay citas disponibles para POLICÍA TARJETA CONFLICTO UCRANIA en Barcelona! "
                     "Ve a la web AHORA!"
                 )
-                # Keep alerting while browser is open for user to act
+                # Keep alerting while page is open for user to act
                 for _ in range(20):
                     await asyncio.sleep(30)
                     notify("CITA DISPONIBLE!", "Sigue disponible - actua rapido!")
-                if browser:
-                    await browser.close()
                 break
 
             elif result == "unavailable":
@@ -483,13 +474,13 @@ async def main():
 
             else:
                 log.warning("Could not determine availability status.")
-                # Browser left open for inspection — wait for user to close it
-                if browser:
-                    log.info("Browser left open. Press Ctrl+C to continue checking.")
+                # Page left open for inspection — wait for user to close it
+                if open_page:
+                    log.info("Page left open for inspection. Close the tab to continue.")
                     try:
-                        while browser.is_connected():
+                        while not open_page.is_closed():
                             await asyncio.sleep(1)
-                    except asyncio.CancelledError:
+                    except Exception:
                         pass
 
             if args.once:
@@ -497,10 +488,10 @@ async def main():
                 break
 
             # Wait until next scheduled check
-                wait_time = seconds_until_next_check()
-                next_time = datetime.now().timestamp() + wait_time
-                next_str = datetime.fromtimestamp(next_time).strftime("%H:%M:%S")
-                log.info(f"Next check at ~{next_str} ({wait_time:.0f}s)")
+            wait_time = seconds_until_next_check()
+            next_time = datetime.now().timestamp() + wait_time
+            next_str = datetime.fromtimestamp(next_time).strftime("%H:%M:%S")
+            log.info(f"Next check at ~{next_str} ({wait_time:.0f}s)")
 
             await asyncio.sleep(wait_time)
 

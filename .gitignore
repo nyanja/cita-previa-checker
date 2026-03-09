@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .DS_Store
 config.py
+found.log
+.browser-profile/
+.chrome-cita/
