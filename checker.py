@@ -284,11 +284,12 @@ async def check_availability(page: Page) -> str | None:
 
     # Appointments ARE available
     available_phrases = [
+        "selecciona oficina",  # Office selection = appointments exist
         "seleccione una de las siguientes citas disponibles",
         "dispone de 5 minutos",
         "siguiente cita disponible",
         "seleccionar cita",
-        "paso 2 de 5",  # If we reach step 2, it means offices are available
+        "paso 2 de 5",
     ]
     for phrase in available_phrases:
         if phrase in text_lower:
@@ -301,10 +302,11 @@ async def check_availability(page: Page) -> str | None:
     return None
 
 
-async def run_check(playwright) -> str:
+async def run_check(playwright) -> tuple[str, object]:
     """
     Run a single availability check through the full flow.
-    Returns: "available", "unavailable", "waf_blocked", or "error"
+    Returns: (result, browser) where result is "available", "unavailable", "waf_blocked", or "error"
+    Browser is returned open when result != "unavailable" so user can interact.
     """
     browser, context = await create_browser_context(playwright)
 
@@ -321,50 +323,59 @@ async def run_check(playwright) -> str:
 
         # Step 1: Load initial page
         if not await step1_load_page(page):
-            return "waf_blocked"
+            await browser.close()
+            return "waf_blocked", None
 
         # Step 2: Select tramite + click Aceptar
         if not await step2_select_tramite(page):
-            return "waf_blocked"
+            await browser.close()
+            return "waf_blocked", None
 
         # Step 3: Click Entrar on info page
         if not await step3_click_entrar(page):
-            return "waf_blocked"
+            await browser.close()
+            return "waf_blocked", None
 
         # Step 4: Fill personal data (NIE + name required)
         if not config.DOC_NUMBER:
             log.error("DOC_NUMBER not configured in config.py - cannot proceed past info page")
-            return "error"
+            await browser.close()
+            return "error", None
 
         if not await step4_fill_personal_data(page):
-            return "error"
+            await browser.close()
+            return "error", None
 
         # Step 5: Click "Solicitar Cita"
         if not await step5_solicitar_cita(page):
-            return "error"
+            await browser.close()
+            return "error", None
 
         # Now check result page for availability
         result = await check_availability(page)
-        if result:
-            if result == "available":
-                # Save screenshot as proof
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                await page.screenshot(path=f"/tmp/cita_AVAILABLE_{ts}.png")
-            return result
+        if result == "unavailable":
+            await browser.close()
+            return "unavailable", None
 
-        # Unknown page state - save screenshot for debugging
+        if result == "available":
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            await page.screenshot(path=f"/tmp/cita_AVAILABLE_{ts}.png")
+            log.info("BROWSER LEFT OPEN - go complete your appointment!")
+            return "available", browser
+
+        # Unknown page state - keep browser open for inspection
         text = await page.inner_text("body")
         log.info(f"Page text (first 500 chars): {text[:500]}")
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         await page.screenshot(path=f"/tmp/cita_unknown_{ts}.png")
         log.info(f"Screenshot saved: /tmp/cita_unknown_{ts}.png")
-        return "error"
+        log.info("BROWSER LEFT OPEN for inspection")
+        return "error", browser
 
     except Exception as e:
         log.error(f"Check failed with exception: {e}")
-        return "error"
-    finally:
         await browser.close()
+        return "error", None
 
 
 async def list_offices(playwright):
@@ -425,7 +436,7 @@ async def main():
     days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     log.info(f"Schedule: check at :{config.CHECK_MINUTES} past each hour")
     for hw in config.HOT_WINDOWS:
-        log.info(f"Hot window: {days[hw['day']]} {hw['hour']:02d}:00 -> every {hw['interval']}s")
+        log.info(f"Hot window: {days[hw['day']]} {hw['hour']:02d}:00")
 
     async with async_playwright() as playwright:
         if args.list_offices:
@@ -439,7 +450,7 @@ async def main():
             check_count += 1
             log.info(f"=== Check #{check_count} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
 
-            result = await run_check(playwright)
+            result, browser = await run_check(playwright)
 
             if result == "available":
                 notify(
@@ -447,9 +458,13 @@ async def main():
                     "Hay citas disponibles para POLICÍA TARJETA CONFLICTO UCRANIA en Barcelona! "
                     "Ve a la web AHORA!"
                 )
-                for _ in range(10):
+                # Keep alerting while browser is open for user to act
+                for _ in range(20):
                     await asyncio.sleep(30)
                     notify("CITA DISPONIBLE!", "Sigue disponible - actua rapido!")
+                if browser:
+                    await browser.close()
+                break
 
             elif result == "unavailable":
                 log.info("No appointments available right now.")
@@ -468,17 +483,20 @@ async def main():
 
             else:
                 log.warning("Could not determine availability status.")
+                # Browser left open for inspection — wait for user to close it
+                if browser:
+                    log.info("Browser left open. Press Ctrl+C to continue checking.")
+                    try:
+                        while browser.is_connected():
+                            await asyncio.sleep(1)
+                    except asyncio.CancelledError:
+                        pass
 
             if args.once:
                 print(f"\nResult: {result}")
                 break
 
-            # Decide wait time: hot window vs normal schedule
-            hw = get_hot_window()
-            if hw:
-                wait_time = hw["interval"] + random.uniform(0, 10)
-                log.info(f"HOT WINDOW active -> next check in {wait_time:.0f}s")
-            else:
+            # Wait until next scheduled check
                 wait_time = seconds_until_next_check()
                 next_time = datetime.now().timestamp() + wait_time
                 next_str = datetime.fromtimestamp(next_time).strftime("%H:%M:%S")
