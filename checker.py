@@ -373,7 +373,7 @@ def run_check() -> str:
 def seconds_until_next_check() -> float:
     now = datetime.now()
     for m in config.CHECK_MINUTES:
-        if m > now.minute or (m == now.minute and now.second < 30):
+        if m > now.minute:
             return (m - now.minute) * 60 - now.second + random.uniform(0, 15)
     first_minute = config.CHECK_MINUTES[0]
     return (60 - now.minute + first_minute) * 60 - now.second + random.uniform(0, 15)
