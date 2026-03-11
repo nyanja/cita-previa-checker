@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import subprocess
+import sys
 import time
 from datetime import datetime
 from urllib.request import urlopen, Request
@@ -25,8 +26,8 @@ import config
 
 # --- Logging ---
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("cita-checker")
@@ -34,13 +35,24 @@ log = logging.getLogger("cita-checker")
 FOUND_LOG = os.path.join(os.path.dirname(__file__), "found.log")
 ENTRY_URL = "https://icp.administracionelectronica.gob.es/icpplus/"
 PROVINCE_VALUE = "/icpplustieb/citar?p=8&locale=es"
+TOTAL_STEPS = 5
 
 
 def log_found(dt: datetime):
     """Append a timestamp to found.log."""
     with open(FOUND_LOG, "a") as f:
         f.write(dt.strftime("%Y-%m-%d %H:%M") + "\n")
-    log.info(f"Logged to {FOUND_LOG}")
+
+
+def progress(step: int, label: str = ""):
+    """Print progress bar: [###--] 3/5"""
+    filled = "#" * step
+    empty = "-" * (TOTAL_STEPS - step)
+    msg = f"  [{filled}{empty}] {step}/{TOTAL_STEPS}"
+    if label:
+        msg += f" {label}"
+    sys.stdout.write(f"\r{msg}")
+    sys.stdout.flush()
 
 
 # --- Notification ---
@@ -77,19 +89,10 @@ def safari_js(js: str) -> str:
         if "Allow JavaScript from Apple Events" in err:
             raise RuntimeError(
                 "Safari requires 'Allow JavaScript from Apple Events' enabled. "
-                "Go to Safari → Settings → Developer → check the option."
+                "Go to Safari -> Settings -> Developer -> check the option."
             )
         raise RuntimeError(f"AppleScript error: {err}")
     return result.stdout.strip()
-
-
-def safari_open(url: str):
-    """Navigate Safari to a URL."""
-    escaped = url.replace('"', '\\"')
-    subprocess.run(
-        ["osascript", "-e", f'tell application "Safari" to set URL of document 1 to "{escaped}"'],
-        capture_output=True, text=True, timeout=10,
-    )
 
 
 def safari_activate():
@@ -100,16 +103,18 @@ def safari_activate():
     )
 
 
-def safari_new_tab():
-    """Open a new tab in Safari."""
+def safari_restart():
+    """Quit and reopen Safari."""
     subprocess.run(
-        ["osascript", "-e",
-         'tell application "Safari"\n'
-         '  activate\n'
-         '  tell window 1 to set current tab to (make new tab with properties {URL:"about:blank"})\n'
-         'end tell'],
-        capture_output=True, timeout=10,
+        ["osascript", "-e", 'tell application "Safari" to quit'],
+        capture_output=True, timeout=5,
     )
+    time.sleep(2)
+    subprocess.run(
+        ["osascript", "-e", 'tell application "Safari" to activate'],
+        capture_output=True, timeout=5,
+    )
+    time.sleep(2)
 
 
 def safari_close_tab():
@@ -120,15 +125,6 @@ def safari_close_tab():
     )
 
 
-def safari_get_url() -> str:
-    """Get current URL of Safari."""
-    result = subprocess.run(
-        ["osascript", "-e", 'tell application "Safari" to return URL of document 1'],
-        capture_output=True, text=True, timeout=5,
-    )
-    return result.stdout.strip()
-
-
 def wait_for_page(timeout: float = 15):
     """Wait for Safari page to finish loading."""
     deadline = time.time() + timeout
@@ -136,12 +132,10 @@ def wait_for_page(timeout: float = 15):
         try:
             state = safari_js("document.readyState")
             if state in ("complete", "interactive"):
-                log.debug(f"Page ready: {state}")
                 return True
-        except Exception as e:
-            log.debug(f"wait_for_page: {e}")
+        except Exception:
+            pass
         time.sleep(0.5)
-    log.warning("wait_for_page timed out")
     return False
 
 
@@ -162,22 +156,17 @@ def is_waf_blocked() -> bool:
     """Check if WAF blocked the request."""
     try:
         title = safari_js("document.title")
-        url = safari_js("window.location.href")
-        log.debug(f"Page: title='{title}' url='{url}'")
         if "Request Rejected" in title:
-            log.error(f"WAF blocked! url={url}")
             return True
         return False
-    except Exception as e:
-        log.debug(f"is_waf_blocked exception: {e}")
+    except Exception:
         return False
 
 
 # --- Flow steps ---
 def step1_select_province() -> bool:
-    log.info("Step 1: Select province...")
+    progress(0)
     try:
-        # Open URL directly in new tab (single step)
         escaped = ENTRY_URL.replace('"', '\\"')
         subprocess.run(
             ["osascript", "-e",
@@ -187,104 +176,124 @@ def step1_select_province() -> bool:
              'end tell'],
             capture_output=True, timeout=10,
         )
-        time.sleep(3)  # Wait for page to actually start loading
+        time.sleep(3)
         if not wait_for_page():
             return False
         if is_waf_blocked():
             return False
 
-        # Accept cookies
         try:
             safari_js("document.querySelector(\\\"a[href*='#']\\\")?.click()")
         except Exception:
             pass
         delay(0.3, 0.7)
 
-        # Select Barcelona
         safari_js(f"document.getElementById('form').value = '{PROVINCE_VALUE}'")
         delay(0.3, 0.7)
 
-        # Click Aceptar
         safari_js("document.getElementById('btnAceptar').click()")
         delay(0.5, 1.0)
         wait_for_page()
+        progress(1)
         return not is_waf_blocked()
     except Exception as e:
-        log.error(f"Step 1 failed: {e}")
+        log.error(f" Step 1 failed: {e}")
         return False
 
 
 def step2_select_tramite() -> bool:
-    log.info("Step 2: Select tramite...")
     try:
         delay(0.3, 0.7)
 
-        # Select office
         safari_js(f"document.getElementById('sede').value = '{config.OFFICE_VALUE}'")
         delay(0.3, 0.7)
 
-        # Select tramite
         js = f"document.querySelector('select[name=\\\"tramiteGrupo[0]\\\"]').value = '{config.TRAMITE_VALUE}'"
         safari_js(js)
         delay(0.3, 0.7)
 
-        # Click Aceptar
         safari_js("document.getElementById('btnAceptar').click()")
         delay(0.5, 1.0)
         wait_for_page()
+        progress(2)
         return not is_waf_blocked()
     except Exception as e:
-        log.error(f"Step 2 failed: {e}")
+        log.error(f" Step 2 failed: {e}")
         return False
 
 
 def step3_click_entrar() -> bool:
-    log.info("Step 3: Click Entrar...")
     try:
         delay(0.3, 0.7)
         safari_js("document.getElementById('btnEntrar').click()")
         delay(0.5, 1.0)
         wait_for_page()
+        progress(3)
         return not is_waf_blocked()
     except Exception as e:
-        log.error(f"Step 3 failed: {e}")
+        log.error(f" Step 3 failed: {e}")
         return False
 
 
 def step4_fill_personal_data() -> bool:
-    log.info("Step 4: Fill personal data...")
     try:
         delay(0.3, 0.7)
 
-        # Fill NIE
         safari_js(f"document.getElementById('txtIdCitado').value = '{config.DOC_NUMBER}'")
         delay(0.2, 0.5)
 
-        # Fill name
         safari_js(f"document.getElementById('txtDesCitado').value = '{config.FULL_NAME}'")
-        delay(0.2, 0.5)
+        time.sleep(2)
 
-        # Click Aceptar
         safari_js("document.getElementById('btnEnviar').click()")
         delay(0.5, 1.0)
         wait_for_page()
+        progress(4)
         return not is_waf_blocked()
     except Exception as e:
-        log.error(f"Step 4 failed: {e}")
+        log.error(f" Step 4 failed: {e}")
         return False
 
 
 def step5_solicitar_cita() -> bool:
-    log.info("Step 5: Click Solicitar Cita...")
     try:
         delay(0.3, 0.7)
         safari_js("document.getElementById('btnEnviar').click()")
         delay(0.5, 1.0)
         wait_for_page()
+        progress(5)
         return not is_waf_blocked()
     except Exception as e:
-        log.error(f"Step 5 failed: {e}")
+        log.error(f" Step 5 failed: {e}")
         return False
+
+
+def get_offices() -> list[str]:
+    """Extract available office addresses from the #idSede select."""
+    try:
+        js = "JSON.stringify([...document.querySelectorAll('#idSede option')].map(o => o.textContent.trim()).filter(t => t))"
+        raw = safari_js(js)
+        return json.loads(raw) if raw else []
+    except Exception:
+        return []
+
+
+def save_page_html():
+    """Save the full page HTML and visible text when cita is found."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = os.path.dirname(__file__)
+    try:
+        html = safari_js("document.documentElement.outerHTML")
+        with open(os.path.join(base, f"found_{ts}.html"), "w") as f:
+            f.write(html)
+    except Exception:
+        pass
+    try:
+        text = safari_js("document.body.innerText")
+        with open(os.path.join(base, f"found_{ts}.txt"), "w") as f:
+            f.write(text)
+    except Exception:
+        pass
 
 
 def check_availability() -> str | None:
@@ -315,58 +324,59 @@ def check_availability() -> str | None:
     return None
 
 
-def run_check() -> str:
-    """Run a single check. Returns: available, unavailable, waf_blocked, error."""
+def run_check() -> tuple[str, list[str]]:
+    """Run a single check. Returns: (result, offices)."""
     try:
         if not step1_select_province():
             safari_close_tab()
-            return "waf_blocked"
+            return "waf_blocked", []
 
         if not step2_select_tramite():
             safari_close_tab()
-            return "waf_blocked"
+            return "waf_blocked", []
 
         if not step3_click_entrar():
             safari_close_tab()
-            return "waf_blocked"
+            return "waf_blocked", []
 
         if not config.DOC_NUMBER:
-            log.error("DOC_NUMBER not configured")
+            log.error(" DOC_NUMBER not configured")
             safari_close_tab()
-            return "error"
+            return "error", []
 
         if not step4_fill_personal_data():
             safari_close_tab()
-            return "error"
+            return "error", []
 
         if not step5_solicitar_cita():
             safari_close_tab()
-            return "error"
+            return "error", []
 
         result = check_availability()
 
         if result == "unavailable":
             safari_close_tab()
-            return "unavailable"
+            return "unavailable", []
 
         if result == "available":
+            offices = get_offices()
             log_found(datetime.now())
+            # save_page_html()
             safari_activate()
-            log.info("TAB LEFT OPEN - go complete your appointment!")
-            return "available"
+            return "available", offices
 
         # Unknown state - leave tab open
         text = page_text()
-        log.info(f"Unknown page: {text[:300]}")
-        return "error"
+        log.warning(f" Unknown page: {text[:200]}")
+        return "error", []
 
     except Exception as e:
-        log.error(f"Check failed: {e}")
+        log.error(f" Check failed: {e}")
         try:
             safari_close_tab()
         except Exception:
             pass
-        return "error"
+        return "error", []
 
 
 # --- Schedule ---
@@ -388,57 +398,60 @@ def check_safari_js_enabled():
         raise SystemExit(1)
 
 
+RESULT_SYMBOLS = {
+    "available": "CITA FOUND!",
+    "unavailable": "no citas",
+    "waf_blocked": "WAF blocked",
+    "error": "error",
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cita Extranjeria Availability Checker")
     parser.add_argument("--once", action="store_true", help="Check once and exit")
     args = parser.parse_args()
 
     check_safari_js_enabled()
-    log.info(f"Schedule: check at :{config.CHECK_MINUTES} past each hour")
 
     check_count = 0
     waf_count = 0
 
     while True:
         check_count += 1
-        log.info(f"=== Check #{check_count} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+        now = datetime.now().strftime("%H:%M:%S")
+        sys.stdout.write(f"{now} #{check_count}")
+        sys.stdout.flush()
 
-        result = run_check()
+        result, offices = run_check()
+        print(f" -> {RESULT_SYMBOLS.get(result, result)}")
 
         if result == "available":
-            notify(
-                "CITA DISPONIBLE!",
-                "Hay citas disponibles para TARJETA CONFLICTO UCRANIA en Barcelona!"
-            )
-            for _ in range(20):
-                time.sleep(30)
-                notify("CITA DISPONIBLE!", "Sigue disponible - actua rapido!")
+            msg = "Hay citas disponibles para TARJETA CONFLICTO UCRANIA en Barcelona!"
+            if offices:
+                msg += "\n\nOficinas:\n" + "\n".join(f"- {o}" for o in offices)
+            msg += "\n\nhttps://icp.administracionelectronica.gob.es/icpplustieb/citar?p=8"
+            notify("CITA DISPONIBLE!", msg)
             break
 
         elif result == "unavailable":
-            log.info("No appointments available.")
             waf_count = 0
 
         elif result == "waf_blocked":
+            safari_restart()
             waf_count += 1
-            log.warning(f"WAF blocked (count: {waf_count})")
             if waf_count >= 3:
                 backoff = config.WAF_BACKOFF_SECONDS
-                log.warning(f"Backing off for {backoff}s...")
+                log.warning(f"3x WAF blocked, backing off {backoff}s...")
                 time.sleep(backoff)
                 waf_count = 0
                 continue
 
-        else:
-            log.warning("Could not determine availability.")
-
         if args.once:
-            print(f"\nResult: {result}")
             break
 
         wait_time = seconds_until_next_check()
         next_str = datetime.fromtimestamp(time.time() + wait_time).strftime("%H:%M:%S")
-        log.info(f"Next check at ~{next_str} ({wait_time:.0f}s)")
+        print(f"         next: ~{next_str} ({wait_time:.0f}s)")
         time.sleep(wait_time)
 
 

@@ -4,5 +4,7 @@ __pycache__/
 .DS_Store
 config.py
 found.log
+found_*.html
+found_*.txt
 .browser-profile/
 .chrome-cita/
