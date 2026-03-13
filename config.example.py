@@ -6,13 +6,7 @@ BASE_URL = "https://icp.administracionelectronica.gob.es/icpplustieb/citar?p=8&l
 # Province is already Barcelona (p=8 in URL)
 TRAMITE_VALUE = "4112"  # POLICÍA TARJETA CONFLICTO UCRANIA
 
-# Office: "99" = Cualquier oficina, or pick a specific one from the list below:
-# "16" = CNP RAMBLA GUIPUSCOA 74, BARCELONA
-# "14" = CNP MALLORCA GRANADOS, BARCELONA
-# "43" = CNP PSJ PLANTA BAJA, BARCELONA
-# "17" = CNP L'HOSPITALET DE LLOBREGAT
-# "18" = CNP BADALONA
-# See full list by running the checker with --list-offices
+# Office: "99" = Cualquier oficina, or pick a specific one
 OFFICE_VALUE = "99"  # Cualquier oficina (any office)
 
 # --- Personal Data (required to proceed past the form) ---
@@ -25,7 +19,7 @@ COUNTRY = "UCRANIA"
 
 # --- Schedule ---
 # Normal schedule: check at these minutes past each hour
-CHECK_MINUTES = [3, 6, 9]
+CHECK_MINUTES = [2, 4, 6, 12, 17, 22, 32, 36, 42]
 
 # Hot windows (optional): no special behavior, same pace as normal
 HOT_WINDOWS = []
