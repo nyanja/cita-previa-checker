@@ -41,7 +41,7 @@ TOTAL_STEPS = 5
 def log_found(dt: datetime):
     """Append a timestamp to found.log."""
     with open(FOUND_LOG, "a") as f:
-        f.write(dt.strftime("%Y-%m-%d %H:%M") + "\n")
+        f.write(dt.strftime("%Y-%m-%d %a %H:%M") + "\n")
 
 
 def progress(step: int, label: str = ""):
@@ -268,12 +268,55 @@ def step5_solicitar_cita() -> bool:
         return False
 
 
+# Approximate km from Calle Gustavo Bécquer 12, Barcelona (Horta-Guinardó)
+OFFICE_DISTANCES = {
+    "PSJ PLANTA BAJA": 2,
+    "RAMBLA GUIPUSCOA": 4,
+    "MALLORCA GRANADOS": 4,
+    "GUADALAJARA": 5,
+    "BADALONA": 7,
+    "SANTA COLOMA DE GRAMENET": 7,
+    "SANT ADRIA DEL BESOS": 8,
+    "MONTCADA I REIXAC": 8,
+    "LHOSPITALET DE LLOBREGAT": 11,
+    "RIPOLLET": 12,
+    "CERDANYOLA DEL VALLES": 13,
+    "CORNELLA DE LLOBREGAT": 15,
+    "SANT FELIU DE LLOBREGAT": 16,
+    "SANT CUGAT DEL VALLES": 16,
+    "EL PRAT DE LLOBREGAT": 18,
+    "SANT BOI DE LLOBREGAT": 18,
+    "RUBI": 20,
+    "SABADELL": 20,
+    "VILADECANS": 20,
+    "CASTELLDEFELS": 25,
+    "TERRASSA": 28,
+    "GRANOLLERS": 30,
+    "MATARO": 30,
+    "VILANOVA I LA GELTRU": 50,
+    "VILAFRANCA DEL PENEDES": 55,
+    "IGUALADA": 65,
+    "MANRESA": 65,
+    "VIC": 70,
+}
+
+
+def office_distance(name: str) -> int:
+    """Return approximate distance in km for sorting."""
+    upper = name.upper()
+    for key, dist in OFFICE_DISTANCES.items():
+        if key in upper:
+            return dist
+    return 999
+
+
 def get_offices() -> list[str]:
-    """Extract available office addresses from the #idSede select."""
+    """Extract available office addresses from the #idSede select, sorted by distance."""
     try:
         js = "JSON.stringify([...document.querySelectorAll('#idSede option')].map(o => o.textContent.trim()).filter(t => t))"
         raw = safari_js(js)
-        return json.loads(raw) if raw else []
+        offices = json.loads(raw) if raw else []
+        return sorted(offices, key=office_distance)
     except Exception:
         return []
 
@@ -428,7 +471,8 @@ def main():
         if result == "available":
             msg = "Hay citas disponibles para TARJETA CONFLICTO UCRANIA en Barcelona!"
             if offices:
-                msg += "\n\nOficinas:\n" + "\n".join(f"- {o}" for o in offices)
+                lines = [f"- {o} (~{office_distance(o)}km)" for o in offices]
+                msg += "\n\nOficinas:\n" + "\n".join(lines)
             msg += "\n\nhttps://icp.administracionelectronica.gob.es/icpplustieb/citar?p=8"
             notify("CITA DISPONIBLE!", msg)
             break
@@ -444,7 +488,11 @@ def main():
                 log.warning(f"3x WAF blocked, backing off {backoff}s...")
                 time.sleep(backoff)
                 waf_count = 0
-                continue
+            continue
+
+        elif result == "error":
+            safari_restart()
+            continue
 
         if args.once:
             break
